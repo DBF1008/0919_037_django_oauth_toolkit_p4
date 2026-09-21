@@ -15,6 +15,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [unreleased]
 
+### Added
+* `cleartokens` management command now supports `--batch-size`, `--batch-interval` and `--dry-run` options and
+  prints real-time cleanup progress. `clear_expired()` accepts matching `batch_size`, `batch_interval`, `dry_run`
+  and `progress_callback` keyword arguments and returns a per-token-type summary. When `prometheus-client` is
+  installed (via the new `prometheus` extra), cleanup duration, deleted token counts and remaining expired token
+  counts are exposed as Prometheus metrics.
+
 ### Deprecated
 * Deprecate the `AUTHENTICATION_SERVER_EXP_TIME_ZONE` setting. Token introspection `exp` values are
   Unix timestamps and are always interpreted as UTC per RFC 7662/RFC 7519. The setting still works

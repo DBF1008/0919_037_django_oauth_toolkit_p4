@@ -423,6 +423,97 @@ class TestClearExpired(BaseTestModels):
         result = excinfo.value.__class__.__name__
         assert result == "ImproperlyConfigured"
 
+    def test_clear_expired_tokens_invalid_batch_size(self):
+        with pytest.raises(ValueError) as excinfo:
+            clear_expired(batch_size=0)
+        assert "batch_size" in str(excinfo.value)
+
+    def test_clear_expired_tokens_dry_run(self):
+        self.oauth2_settings.REFRESH_TOKEN_EXPIRE_SECONDS = self.delta_secs // 2
+
+        summary = clear_expired(dry_run=True)
+
+        # nothing was deleted
+        assert AccessToken.objects.count() == 2 * self.num_tokens
+        assert RefreshToken.objects.count() == self.num_tokens // 2
+        assert Grant.objects.count() == 2 * self.num_tokens
+        # the summary reports what would have been deleted, including the
+        # access tokens that deleting the expired refresh tokens would orphan
+        assert summary["refresh_token_revoked"] == 0
+        assert summary["refresh_token_expired"] == self.num_tokens // 4
+        assert summary["access_token"] == self.num_tokens
+        assert summary["id_token"] == 0
+        assert summary["grant"] == self.num_tokens
+
+    def test_clear_expired_tokens_progress_callback(self):
+        self.oauth2_settings.REFRESH_TOKEN_EXPIRE_SECONDS = self.delta_secs // 2
+        calls = []
+
+        clear_expired(
+            batch_size=10, batch_interval=0, progress_callback=lambda **kwargs: calls.append(kwargs)
+        )
+
+        assert calls, "progress_callback should have been called"
+        expected_keys = {
+            "token_type",
+            "batch_number",
+            "batch_count",
+            "deleted_total",
+            "remaining",
+            "batch_ids",
+        }
+        assert all(set(call) == expected_keys for call in calls)
+        access_token_calls = [call for call in calls if call["token_type"] == "access_token"]
+        assert len(access_token_calls) == self.num_tokens // 10
+        assert sum(call["batch_count"] for call in access_token_calls) == self.num_tokens
+        assert access_token_calls[-1]["remaining"] == 0
+        assert access_token_calls[-1]["deleted_total"] == self.num_tokens
+
+    def test_clear_expired_tokens_returns_summary(self):
+        self.oauth2_settings.REFRESH_TOKEN_EXPIRE_SECONDS = self.delta_secs // 2
+
+        summary = clear_expired()
+
+        assert summary == {
+            "refresh_token_revoked": 0,
+            "refresh_token_expired": self.num_tokens // 4,
+            "access_token": self.num_tokens,
+            "id_token": 0,
+            "grant": self.num_tokens,
+        }
+
+    def test_clear_expired_tokens_prometheus_metrics(self):
+        prometheus_client = pytest.importorskip("prometheus_client")
+        self.oauth2_settings.REFRESH_TOKEN_EXPIRE_SECONDS = self.delta_secs // 2
+        registry = prometheus_client.REGISTRY
+        deleted_before = (
+            registry.get_sample_value(
+                "oauth2_provider_clear_expired_deleted_total", {"token_type": "access_token"}
+            )
+            or 0
+        )
+        duration_before = (
+            registry.get_sample_value(
+                "oauth2_provider_clear_expired_duration_seconds_count", {"token_type": "access_token"}
+            )
+            or 0
+        )
+
+        clear_expired()
+
+        deleted_after = registry.get_sample_value(
+            "oauth2_provider_clear_expired_deleted_total", {"token_type": "access_token"}
+        )
+        assert deleted_after - deleted_before == self.num_tokens
+        duration_after = registry.get_sample_value(
+            "oauth2_provider_clear_expired_duration_seconds_count", {"token_type": "access_token"}
+        )
+        assert duration_after - duration_before == 1
+        remaining = registry.get_sample_value(
+            "oauth2_provider_clear_expired_remaining", {"token_type": "access_token"}
+        )
+        assert remaining == 0
+
     def test_clear_expired_tokens_with_tokens(self):
         self.oauth2_settings.CLEAR_EXPIRED_TOKENS_BATCH_SIZE = 10
         self.oauth2_settings.CLEAR_EXPIRED_TOKENS_BATCH_INTERVAL = 0.0

@@ -811,24 +811,151 @@ def get_refresh_token_admin_class():
     return refresh_token_admin_class
 
 
-def clear_expired():
-    def batch_delete(queryset, query):
-        CLEAR_EXPIRED_TOKENS_BATCH_SIZE = oauth2_settings.CLEAR_EXPIRED_TOKENS_BATCH_SIZE
-        CLEAR_EXPIRED_TOKENS_BATCH_INTERVAL = oauth2_settings.CLEAR_EXPIRED_TOKENS_BATCH_INTERVAL
-        current_no = start_no = queryset.count()
+class _NullMetric:
+    """No-op stand-in for a Prometheus metric when prometheus_client is unavailable."""
 
-        while current_no:
-            flat_queryset = queryset.values_list("id", flat=True)[:CLEAR_EXPIRED_TOKENS_BATCH_SIZE]
-            batch_length = flat_queryset.count()
-            queryset.model.objects.filter(id__in=list(flat_queryset)).delete()
-            logger.debug(f"{batch_length} tokens deleted, {current_no - batch_length} left")
-            queryset = queryset.model.objects.filter(query)
-            time.sleep(CLEAR_EXPIRED_TOKENS_BATCH_INTERVAL)
-            current_no = queryset.count()
+    def labels(self, *args, **kwargs):
+        return self
 
-        stop_no = queryset.model.objects.filter(query).count()
-        deleted = start_no - stop_no
-        return deleted
+    def observe(self, value):
+        pass
+
+    def inc(self, amount=1):
+        pass
+
+    def set(self, value):
+        pass
+
+
+_CLEAR_EXPIRED_METRICS = None
+
+
+def _get_clear_expired_metrics():
+    """
+    Return the Prometheus metrics exposed by clear_expired().
+
+    Metrics are created lazily so that importing this module never requires
+    prometheus_client. When prometheus_client is not installed, no-op metrics
+    are returned and cleanup behaves exactly as before.
+    """
+    global _CLEAR_EXPIRED_METRICS
+    if _CLEAR_EXPIRED_METRICS is not None:
+        return _CLEAR_EXPIRED_METRICS
+
+    null_metrics = {
+        "duration": _NullMetric(),
+        "deleted": _NullMetric(),
+        "remaining": _NullMetric(),
+    }
+    try:
+        from prometheus_client import Counter, Gauge, Histogram
+    except ImportError:
+        logger.debug("prometheus_client is not installed; clear_expired metrics are disabled.")
+        _CLEAR_EXPIRED_METRICS = null_metrics
+        return _CLEAR_EXPIRED_METRICS
+
+    try:
+        _CLEAR_EXPIRED_METRICS = {
+            "duration": Histogram(
+                "oauth2_provider_clear_expired_duration_seconds",
+                "Time spent clearing expired tokens, per token type.",
+                ["token_type"],
+            ),
+            "deleted": Counter(
+                "oauth2_provider_clear_expired_deleted_total",
+                "Total number of expired tokens deleted, per token type.",
+                ["token_type"],
+            ),
+            "remaining": Gauge(
+                "oauth2_provider_clear_expired_remaining",
+                "Expired tokens still remaining after the last cleanup, per token type.",
+                ["token_type"],
+            ),
+        }
+    except ValueError:
+        # Metrics are already registered (e.g. the module was reloaded);
+        # avoid duplicate registration errors and keep cleanup working.
+        logger.warning("clear_expired Prometheus metrics already registered; metrics disabled.")
+        _CLEAR_EXPIRED_METRICS = null_metrics
+    return _CLEAR_EXPIRED_METRICS
+
+
+def clear_expired(*, batch_size=None, batch_interval=None, dry_run=False, progress_callback=None):
+    """
+    Delete expired tokens from the database in batches.
+
+    :param batch_size: Number of tokens deleted per batch. Defaults to the
+        ``CLEAR_EXPIRED_TOKENS_BATCH_SIZE`` setting.
+    :param batch_interval: Seconds to sleep between batch deletions. Defaults
+        to the ``CLEAR_EXPIRED_TOKENS_BATCH_INTERVAL`` setting.
+    :param dry_run: When True, count and report the tokens that would be
+        deleted without deleting anything.
+    :param progress_callback: Optional callable invoked after every batch with
+        the ``token_type``, ``batch_number``, ``batch_count``, ``deleted_total``,
+        ``remaining`` and ``batch_ids`` keyword arguments.
+    :return: A dict mapping each token type to the number of tokens deleted
+        (or that would be deleted when ``dry_run`` is True).
+
+    Deletion order matters for foreign key integrity: refresh tokens are
+    removed first so that their bound access tokens become orphans
+    (``refresh_token__isnull=True``) and can then be deleted without violating
+    foreign key constraints; ID tokens are removed after access tokens for the
+    same reason.
+    """
+    if batch_size is None:
+        batch_size = oauth2_settings.CLEAR_EXPIRED_TOKENS_BATCH_SIZE
+    if batch_interval is None:
+        batch_interval = oauth2_settings.CLEAR_EXPIRED_TOKENS_BATCH_INTERVAL
+    if batch_size < 1:
+        raise ValueError("batch_size must be a positive integer")
+
+    metrics = _get_clear_expired_metrics()
+    summary = {}
+
+    def batch_delete(queryset, query, token_type):
+        started_at = time.monotonic()
+        deleted_total = 0
+        batch_number = 0
+        last_seen_id = None
+
+        while True:
+            if dry_run:
+                # Nothing is deleted, so paginate past the ids already seen.
+                pending = queryset if last_seen_id is None else queryset.filter(id__gt=last_seen_id)
+                batch_ids = list(pending.order_by("id").values_list("id", flat=True)[:batch_size])
+            else:
+                batch_ids = list(queryset.values_list("id", flat=True)[:batch_size])
+            if not batch_ids:
+                break
+            batch_number += 1
+            if dry_run:
+                last_seen_id = batch_ids[-1]
+            else:
+                queryset.model.objects.filter(id__in=batch_ids).delete()
+            deleted_total += len(batch_ids)
+            if dry_run:
+                remaining = queryset.filter(id__gt=last_seen_id).count()
+            else:
+                remaining = queryset.model.objects.filter(query).count()
+            logger.debug("%s %s tokens deleted, %s left", len(batch_ids), token_type, remaining)
+            if progress_callback is not None:
+                progress_callback(
+                    token_type=token_type,
+                    batch_number=batch_number,
+                    batch_count=len(batch_ids),
+                    deleted_total=deleted_total,
+                    remaining=remaining,
+                    batch_ids=batch_ids,
+                )
+            if remaining:
+                time.sleep(batch_interval)
+
+        metrics["duration"].labels(token_type=token_type).observe(time.monotonic() - started_at)
+        if not dry_run:
+            metrics["deleted"].labels(token_type=token_type).inc(deleted_total)
+        metrics["remaining"].labels(token_type=token_type).set(queryset.model.objects.filter(query).count())
+        summary[token_type] = deleted_total
+        return deleted_total
 
     now = timezone.now()
     refresh_expire_at = None
@@ -848,37 +975,50 @@ def clear_expired():
         refresh_expire_at = now - REFRESH_TOKEN_EXPIRE_SECONDS
 
     if refresh_expire_at:
+        # Refresh tokens must be deleted before their bound access tokens so
+        # the access tokens become orphans and eligible for deletion below.
         revoked_query = models.Q(revoked__lt=refresh_expire_at)
         revoked = refresh_token_model.objects.filter(revoked_query)
 
-        revoked_deleted_no = batch_delete(revoked, revoked_query)
+        revoked_deleted_no = batch_delete(revoked, revoked_query, "refresh_token_revoked")
         logger.info("%s Revoked refresh tokens deleted", revoked_deleted_no)
 
         expired_query = models.Q(access_token__expires__lt=refresh_expire_at)
         expired = refresh_token_model.objects.filter(expired_query)
 
-        expired_deleted_no = batch_delete(expired, expired_query)
+        expired_deleted_no = batch_delete(expired, expired_query, "refresh_token_expired")
         logger.info("%s Expired refresh tokens deleted", expired_deleted_no)
     else:
         logger.info("refresh_expire_at is %s. No refresh tokens deleted.", refresh_expire_at)
 
     access_token_query = models.Q(refresh_token__isnull=True, expires__lt=now)
+    if dry_run and refresh_expire_at:
+        # No refresh tokens are actually deleted in dry run, so also preview
+        # the access tokens that deleting them would have orphaned.
+        access_token_query |= models.Q(
+            models.Q(expires__lt=refresh_expire_at) | models.Q(refresh_token__revoked__lt=refresh_expire_at),
+            refresh_token__isnull=False,
+        )
     access_tokens = access_token_model.objects.filter(access_token_query)
 
-    access_tokens_delete_no = batch_delete(access_tokens, access_token_query)
+    access_tokens_delete_no = batch_delete(access_tokens, access_token_query, "access_token")
     logger.info("%s Expired access tokens deleted", access_tokens_delete_no)
 
+    # ID tokens are deleted after access tokens because an ID token is only
+    # orphaned (``access_token__isnull=True``) once its access token is gone.
     id_token_query = models.Q(access_token__isnull=True, expires__lt=now)
     id_tokens = id_token_model.objects.filter(id_token_query)
 
-    id_tokens_delete_no = batch_delete(id_tokens, id_token_query)
+    id_tokens_delete_no = batch_delete(id_tokens, id_token_query, "id_token")
     logger.info("%s Expired ID tokens deleted", id_tokens_delete_no)
 
     grants_query = models.Q(expires__lt=now)
     grants = grant_model.objects.filter(grants_query)
 
-    grants_deleted_no = batch_delete(grants, grants_query)
+    grants_deleted_no = batch_delete(grants, grants_query, "grant")
     logger.info("%s Expired grant tokens deleted", grants_deleted_no)
+
+    return summary
 
 
 def redirect_to_uri_allowed(uri, allowed_uris):

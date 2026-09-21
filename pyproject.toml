@@ -63,9 +63,13 @@ docs = [
 	"sphinx==7.2.6",
 	"sphinx-rtd-theme==1.3.0",
 ]
+prometheus = [
+	"prometheus-client>=0.20",
+]
 test = [
 	"djangorestframework",
 	"coverage",
+	"prometheus-client>=0.20",
 	"pytest",
 	"pytest-cov",
 	"pytest-django",

@@ -22,6 +22,33 @@ To prevent the CPU and RAM high peaks during deletion process use ``CLEAR_EXPIRE
 
 The ``cleartokens`` management command will also delete expired access and ID tokens alongside expired refresh tokens.
 
+Refresh tokens are deleted before their bound access tokens, and access tokens before ID tokens, so that no foreign
+key constraint is violated during the cleanup.
+
+The command prints the cleanup progress in real time, one line per batch, and a summary of how many tokens of each
+type were deleted. The batch size and interval can be overridden per run, and ``--dry-run`` previews the tokens
+(including their ids) that would be deleted without deleting anything::
+
+    usage: manage.py cleartokens [--batch-size BATCH_SIZE] [--batch-interval BATCH_INTERVAL] [--dry-run]
+
+    optional arguments:
+      --batch-size BATCH_SIZE
+                            Number of tokens deleted per batch. Defaults to the
+                            CLEAR_EXPIRED_TOKENS_BATCH_SIZE setting.
+      --batch-interval BATCH_INTERVAL
+                            Seconds to sleep between batch deletions. Defaults to
+                            the CLEAR_EXPIRED_TOKENS_BATCH_INTERVAL setting.
+      --dry-run             Preview the tokens that would be deleted without
+                            deleting anything.
+
+When `prometheus-client <https://github.com/prometheus/client_python>`_ is installed (for example via the
+``prometheus`` extra), the cleanup exposes the following Prometheus metrics, labelled by token type
+(``refresh_token_revoked``, ``refresh_token_expired``, ``access_token``, ``id_token``, ``grant``):
+
+* ``oauth2_provider_clear_expired_duration_seconds``: histogram of the time spent clearing each token type.
+* ``oauth2_provider_clear_expired_deleted_total``: counter of the tokens deleted per token type.
+* ``oauth2_provider_clear_expired_remaining``: gauge of the expired tokens still remaining after the last cleanup.
+
 Note: Refresh tokens need to expire before AccessTokens can be removed from the
 database. Using ``cleartokens`` without ``REFRESH_TOKEN_EXPIRE_SECONDS`` has limited effect.
 
