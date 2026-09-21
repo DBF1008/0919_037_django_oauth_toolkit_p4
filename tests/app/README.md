@@ -65,6 +65,27 @@ curl --location 'http://localhost:8000/o/token/' \
 
 The response should include the access token.
 
+### Clearing expired tokens (batch cleanup, dry-run, metrics)
+
+The built-in `cleartokens` command removes expired refresh/access/ID tokens and grants in batches:
+
+```sh
+python manage.py cleartokens --dry-run            # preview, deletes nothing
+python manage.py cleartokens --batch-size 1000    # override CLEAR_EXPIRED_TOKENS_BATCH_SIZE
+python manage.py cleartokens --batch-interval 0.1 # pause between batches
+```
+
+The IDP also ships `clear_expired_tokens_demo`, a small command that calls `oauth2_provider.models.clear_expired`
+programmatically and prints per-batch progress, demonstrating how to embed the cleanup in custom scripts or
+scheduled tasks:
+
+```sh
+python manage.py clear_expired_tokens_demo --dry-run --batch-size 100
+```
+
+When `prometheus-client` is installed (`pip install django-oauth-toolkit[metrics]`), cleanup runs expose
+duration, deleted-count and remaining-expired-rows metrics.
+
 ## /test/app/rp
 
 This is an example RP. It is a SPA built with Svelte.

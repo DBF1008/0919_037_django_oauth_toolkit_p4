@@ -80,13 +80,18 @@ We'll add ours now in :file:`tutorial/tasks.py`:
 
 .. code-block:: python
 
+    import logging
+
     from celery import shared_task
+
+    logger = logging.getLogger(__name__)
 
     @shared_task
     def clear_tokens():
         from oauth2_provider.models import clear_expired
 
-        clear_expired()
+        result = clear_expired(progress_callback=lambda *event: logger.info("cleartokens progress: %s", event))
+        logger.info("clear_expired removed %s tokens", result.as_dict())
 
 Finally, update :file:`tutorial/__init__.py` to make sure Celery gets loaded when the app starts up:
 

@@ -71,6 +71,10 @@ test = [
 	"pytest-django",
 	"pytest-xdist",
 	"pytest-mock",
+	"prometheus-client",
+]
+metrics = [
+	"prometheus-client>=0.17",
 ]
 
 [project.urls]

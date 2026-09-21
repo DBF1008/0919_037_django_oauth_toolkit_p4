@@ -446,13 +446,15 @@ CLEAR_EXPIRED_TOKENS_BATCH_SIZE
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 Default: ``10000``
 
-The size of delete batches used by ``cleartokens`` management command.
+The size of delete batches used by ``cleartokens`` management command. Can be overridden per run with the
+command's ``--batch-size`` option.
 
 CLEAR_EXPIRED_TOKENS_BATCH_INTERVAL
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 Default: ``0``
 
-Time of sleep in seconds used by ``cleartokens`` management command between batch deletions.
+Time of sleep in seconds used by ``cleartokens`` management command between batch deletions. Can be overridden
+per run with the command's ``--batch-interval`` option.
 
 Set this to a non-zero value (e.g. ``0.1``) to add a pause between batch sizes to reduce system
 load when clearing large batches of expired tokens.

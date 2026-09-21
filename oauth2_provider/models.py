@@ -2,7 +2,7 @@ import hashlib
 import logging
 import time
 import uuid
-from contextlib import suppress
+from contextlib import nullcontext, suppress
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from datetime import timezone as dt_timezone
@@ -21,6 +21,7 @@ from jwcrypto import jwk
 from jwcrypto.common import base64url_encode
 from oauthlib.oauth2.rfc6749 import errors
 
+from . import metrics
 from .generators import generate_client_id, generate_client_secret
 from .scopes import get_scopes_backend
 from .settings import oauth2_settings
@@ -811,74 +812,306 @@ def get_refresh_token_admin_class():
     return refresh_token_admin_class
 
 
-def clear_expired():
-    def batch_delete(queryset, query):
-        CLEAR_EXPIRED_TOKENS_BATCH_SIZE = oauth2_settings.CLEAR_EXPIRED_TOKENS_BATCH_SIZE
-        CLEAR_EXPIRED_TOKENS_BATCH_INTERVAL = oauth2_settings.CLEAR_EXPIRED_TOKENS_BATCH_INTERVAL
-        current_no = start_no = queryset.count()
+@dataclass
+class ClearExpiredResult:
+    """Summary of a single :func:`clear_expired` run."""
 
-        while current_no:
-            flat_queryset = queryset.values_list("id", flat=True)[:CLEAR_EXPIRED_TOKENS_BATCH_SIZE]
-            batch_length = flat_queryset.count()
-            queryset.model.objects.filter(id__in=list(flat_queryset)).delete()
-            logger.debug(f"{batch_length} tokens deleted, {current_no - batch_length} left")
-            queryset = queryset.model.objects.filter(query)
-            time.sleep(CLEAR_EXPIRED_TOKENS_BATCH_INTERVAL)
-            current_no = queryset.count()
+    revoked_refresh_tokens: int = 0
+    expired_refresh_tokens: int = 0
+    access_tokens: int = 0
+    id_tokens: int = 0
+    grants: int = 0
 
-        stop_no = queryset.model.objects.filter(query).count()
-        deleted = start_no - stop_no
-        return deleted
+    def as_dict(self):
+        return {
+            "revoked_refresh_tokens": self.revoked_refresh_tokens,
+            "expired_refresh_tokens": self.expired_refresh_tokens,
+            "access_tokens": self.access_tokens,
+            "id_tokens": self.id_tokens,
+            "grants": self.grants,
+        }
 
-    now = timezone.now()
-    refresh_expire_at = None
+
+def _clear_expired_batches(
+    queryset_factory, batch_size, batch_interval, dry_run=False, progress_callback=None
+):
+    """
+    Delete (or preview) objects in batches.
+
+    :param queryset_factory: zero-argument callable returning a fresh queryset
+        of the objects to remove. It is re-invoked after every batch so filters
+        involving joins or subqueries are never reconstructed from internal
+        query state.
+    :param batch_size: maximum number of rows removed per batch
+    :param batch_interval: seconds to pause between batches
+    :param dry_run: when True nothing is deleted; the number of rows that would
+        be removed is returned
+    :param progress_callback: optional callable invoked after every batch with
+        ``(deleted_in_batch, deleted_total, remaining, batch_ids)``; in
+        dry-run mode no rows are removed but the primary keys of each batch
+        that *would* be deleted are still reported
+    :returns: number of deleted rows (or rows that would be deleted in
+        dry-run mode)
+    """
+    model = queryset_factory().model
+    db = router.db_for_write(model)
+    total = queryset_factory().using(db).count()
+
+    deleted_total = 0
+    remaining = total
+    while remaining:
+        queryset = queryset_factory().using(db)
+        batch_ids = list(queryset.values_list("id", flat=True)[:batch_size])
+        if not batch_ids:
+            break
+        if not dry_run:
+            with transaction.atomic(using=db):
+                model.objects.using(db).filter(id__in=batch_ids).delete()
+        deleted_total += len(batch_ids)
+        if not dry_run:
+            # Re-run the base query so concurrent inserts are picked up and the
+            # loop terminates once every matching row is gone.
+            if batch_interval:
+                time.sleep(batch_interval)
+            remaining = queryset_factory().using(db).count()
+        else:
+            remaining = max(remaining - len(batch_ids), 0)
+        logger.debug("%s rows %s, %s left", len(batch_ids), "previewed" if dry_run else "deleted", remaining)
+        if progress_callback:
+            progress_callback(len(batch_ids), deleted_total, remaining, batch_ids)
+
+    return deleted_total
+
+
+def _delete_expired_refresh_batches(
+    refresh_queryset_factory,
+    access_token_model,
+    batch_size,
+    batch_interval,
+    dry_run=False,
+    access_progress_callback=None,
+    refresh_progress_callback=None,
+):
+    """
+    Delete expired refresh tokens together with their linked access tokens,
+    batch by batch. For every batch the dependent access tokens (ID tokens
+    cascade) are removed *before* the refresh tokens, inside the same
+    transaction, preserving the parent-before-child deletion order required by
+    foreign-key constraints.
+
+    :returns: ``(deleted_access_tokens, deleted_refresh_tokens)`` (or the
+        dry-run counts that would be deleted)
+    """
+    refresh_model = refresh_queryset_factory().model
+    refresh_db = router.db_for_write(refresh_model)
+    access_db = router.db_for_write(access_token_model)
+    total = refresh_queryset_factory().using(refresh_db).count()
+
+    access_deleted_total = 0
+    refresh_deleted_total = 0
+    remaining = total
+    while remaining:
+        batch_ids = list(
+            refresh_queryset_factory().using(refresh_db).values_list("id", flat=True)[:batch_size]
+        )
+        if not batch_ids:
+            break
+
+        linked_access = access_token_model.objects.using(access_db).filter(refresh_token__pk__in=batch_ids)
+        if dry_run:
+            linked_access_ids = list(linked_access.values_list("id", flat=True))
+            access_deleted = len(linked_access_ids)
+            refresh_deleted = len(batch_ids)
+            remaining = max(remaining - refresh_deleted, 0)
+        else:
+            # When access and refresh tokens live in different databases they
+            # cannot share a transaction; both deletions are unconditional by
+            # primary key so a retry remains safe.
+            transaction_context = (
+                transaction.atomic(using=refresh_db) if access_db == refresh_db else nullcontext()
+            )
+            with transaction_context:
+                access_deleted = linked_access.delete()[0]
+                # The dependent access token is gone, but the refresh token is
+                # removed only afterwards: child-first ordering keeps any
+                # reverse foreign-key constraints satisfied.
+                if access_progress_callback:
+                    access_progress_callback(
+                        access_deleted,
+                        access_deleted_total + access_deleted,
+                        max(remaining - len(batch_ids), 0),
+                        None,
+                    )
+                refresh_deleted, _ = refresh_model.objects.using(refresh_db).filter(id__in=batch_ids).delete()
+            if batch_interval:
+                time.sleep(batch_interval)
+            remaining = refresh_queryset_factory().using(refresh_db).count()
+
+        access_deleted_total += access_deleted
+        refresh_deleted_total += refresh_deleted
+        logger.debug(
+            "%s linked access tokens and %s refresh tokens %s, %s expired refresh tokens left",
+            access_deleted,
+            refresh_deleted,
+            "previewed" if dry_run else "deleted",
+            remaining,
+        )
+        if dry_run and access_progress_callback:
+            access_progress_callback(access_deleted, access_deleted_total, remaining, linked_access_ids)
+        if refresh_progress_callback:
+            refresh_progress_callback(refresh_deleted, refresh_deleted_total, remaining, batch_ids)
+
+    return access_deleted_total, refresh_deleted_total
+
+
+def clear_expired(
+    batch_size=None,
+    batch_interval=None,
+    dry_run=False,
+    progress_callback=None,
+):
+    """
+    Remove expired tokens and grants, in configurable batches.
+
+    Refresh tokens are removed together with their related access (and, by
+    database cascade, ID) tokens *before* standalone expired access tokens are
+    handled. Removing the dependent rows first avoids foreign-key constraint
+    failures and ensures no expired token is left dangling.
+
+    :param batch_size: override ``CLEAR_EXPIRED_TOKENS_BATCH_SIZE``
+    :param batch_interval: override ``CLEAR_EXPIRED_TOKENS_BATCH_INTERVAL``
+    :param dry_run: when True nothing is deleted; the returned
+        :class:`ClearExpiredResult` reports the rows that would be removed
+    :param progress_callback: callable invoked per batch with
+        ``(stage, deleted_in_batch, deleted_total, remaining, batch_ids)``
+    :rtype: ClearExpiredResult
+    """
+    if batch_size is None:
+        batch_size = oauth2_settings.CLEAR_EXPIRED_TOKENS_BATCH_SIZE
+    if batch_interval is None:
+        batch_interval = oauth2_settings.CLEAR_EXPIRED_TOKENS_BATCH_INTERVAL
+    if batch_size <= 0:
+        raise ValueError("batch_size must be a positive integer")
+    if batch_interval < 0:
+        raise ValueError("batch_interval cannot be negative")
+
     access_token_model = get_access_token_model()
     refresh_token_model = get_refresh_token_model()
     id_token_model = get_id_token_model()
     grant_model = get_grant_model()
-    REFRESH_TOKEN_EXPIRE_SECONDS = oauth2_settings.REFRESH_TOKEN_EXPIRE_SECONDS
 
-    if REFRESH_TOKEN_EXPIRE_SECONDS:
-        if not isinstance(REFRESH_TOKEN_EXPIRE_SECONDS, timedelta):
-            try:
-                REFRESH_TOKEN_EXPIRE_SECONDS = timedelta(seconds=REFRESH_TOKEN_EXPIRE_SECONDS)
-            except TypeError:
-                e = "REFRESH_TOKEN_EXPIRE_SECONDS must be either a timedelta or seconds"
-                raise ImproperlyConfigured(e)
-        refresh_expire_at = now - REFRESH_TOKEN_EXPIRE_SECONDS
+    result = ClearExpiredResult()
+    start = time.monotonic()
+    status = "success"
 
-    if refresh_expire_at:
-        revoked_query = models.Q(revoked__lt=refresh_expire_at)
-        revoked = refresh_token_model.objects.filter(revoked_query)
+    def report(stage):
+        def inner(deleted_in_batch, deleted_total, remaining, batch_ids=None):
+            if progress_callback:
+                progress_callback(stage, deleted_in_batch, deleted_total, remaining, batch_ids)
 
-        revoked_deleted_no = batch_delete(revoked, revoked_query)
-        logger.info("%s Revoked refresh tokens deleted", revoked_deleted_no)
+        return inner
 
-        expired_query = models.Q(access_token__expires__lt=refresh_expire_at)
-        expired = refresh_token_model.objects.filter(expired_query)
+    try:
+        now = timezone.now()
+        refresh_expire_at = None
+        REFRESH_TOKEN_EXPIRE_SECONDS = oauth2_settings.REFRESH_TOKEN_EXPIRE_SECONDS
 
-        expired_deleted_no = batch_delete(expired, expired_query)
-        logger.info("%s Expired refresh tokens deleted", expired_deleted_no)
-    else:
-        logger.info("refresh_expire_at is %s. No refresh tokens deleted.", refresh_expire_at)
+        if REFRESH_TOKEN_EXPIRE_SECONDS:
+            if not isinstance(REFRESH_TOKEN_EXPIRE_SECONDS, timedelta):
+                try:
+                    REFRESH_TOKEN_EXPIRE_SECONDS = timedelta(seconds=REFRESH_TOKEN_EXPIRE_SECONDS)
+                except TypeError:
+                    raise ImproperlyConfigured(
+                        "REFRESH_TOKEN_EXPIRE_SECONDS must be either a timedelta or seconds"
+                    )
+            refresh_expire_at = now - REFRESH_TOKEN_EXPIRE_SECONDS
 
-    access_token_query = models.Q(refresh_token__isnull=True, expires__lt=now)
-    access_tokens = access_token_model.objects.filter(access_token_query)
+        def delete_stage(stage, queryset_factory):
+            return _clear_expired_batches(
+                queryset_factory,
+                batch_size,
+                batch_interval,
+                dry_run=dry_run,
+                progress_callback=report(stage),
+            )
 
-    access_tokens_delete_no = batch_delete(access_tokens, access_token_query)
-    logger.info("%s Expired access tokens deleted", access_tokens_delete_no)
+        if refresh_expire_at:
+            revoked_query = models.Q(revoked__lt=refresh_expire_at)
+            result.revoked_refresh_tokens = delete_stage(
+                "revoked_refresh_tokens",
+                lambda q=revoked_query: refresh_token_model.objects.filter(q),
+            )
+            logger.info("%s Revoked refresh tokens deleted", result.revoked_refresh_tokens)
 
-    id_token_query = models.Q(access_token__isnull=True, expires__lt=now)
-    id_tokens = id_token_model.objects.filter(id_token_query)
+            # Expired refresh tokens own their access tokens: for every batch
+            # the dependent access tokens (cascading to ID tokens) are removed
+            # first inside the same transaction, so the refresh token deletion
+            # can never trip a foreign-key constraint.
+            expired_refresh_query = models.Q(access_token__expires__lt=refresh_expire_at)
 
-    id_tokens_delete_no = batch_delete(id_tokens, id_token_query)
-    logger.info("%s Expired ID tokens deleted", id_tokens_delete_no)
+            def expired_refresh_factory():
+                return refresh_token_model.objects.filter(expired_refresh_query)
 
-    grants_query = models.Q(expires__lt=now)
-    grants = grant_model.objects.filter(grants_query)
+            linked_access_deleted, linked_refresh_deleted = _delete_expired_refresh_batches(
+                expired_refresh_factory,
+                access_token_model,
+                batch_size,
+                batch_interval,
+                dry_run=dry_run,
+                access_progress_callback=report("access_tokens"),
+                refresh_progress_callback=report("expired_refresh_tokens"),
+            )
+            result.access_tokens += linked_access_deleted
+            result.expired_refresh_tokens = linked_refresh_deleted
+            logger.info("%s Expired refresh tokens deleted", result.expired_refresh_tokens)
+        else:
+            logger.info("refresh_expire_at is %s. No refresh tokens deleted.", refresh_expire_at)
 
-    grants_deleted_no = batch_delete(grants, grants_query)
-    logger.info("%s Expired grant tokens deleted", grants_deleted_no)
+        # Standalone expired access tokens (no linked refresh token left).
+        orphan_access_query = models.Q(refresh_token__isnull=True, expires__lt=now)
+        result.access_tokens += delete_stage(
+            "access_tokens", lambda q=orphan_access_query: access_token_model.objects.filter(q)
+        )
+        logger.info("%s Expired access tokens deleted", result.access_tokens)
+
+        # ID tokens linked to deleted access tokens cascade away; only the
+        # standalone expired ones need an explicit cleanup.
+        orphan_id_token_query = models.Q(access_token__isnull=True, expires__lt=now)
+        result.id_tokens = delete_stage(
+            "id_tokens", lambda q=orphan_id_token_query: id_token_model.objects.filter(q)
+        )
+        logger.info("%s Expired ID tokens deleted", result.id_tokens)
+
+        result.grants = delete_stage(
+            "grants", lambda q=models.Q(expires__lt=now): grant_model.objects.filter(q)
+        )
+        logger.info("%s Expired grant tokens deleted", result.grants)
+    except Exception:
+        status = "failure"
+        raise
+    finally:
+        elapsed = time.monotonic() - start
+
+        metrics.clear_expired_duration.labels(status=status).observe(elapsed)
+        if not dry_run:
+            for token_type, deleted in result.as_dict().items():
+                metrics.clear_expired_deleted_total.labels(token_type=token_type).inc(deleted)
+
+            now = timezone.now()
+            refresh_remaining = refresh_token_model.objects.filter(
+                models.Q(revoked__lt=now) | models.Q(access_token__expires__lt=now)
+            ).count()
+            remaining_by_type = {
+                "revoked_refresh_tokens": refresh_token_model.objects.filter(revoked__lt=now).count(),
+                "expired_refresh_tokens": refresh_remaining,
+                "access_tokens": access_token_model.objects.filter(expires__lt=now).count(),
+                "id_tokens": id_token_model.objects.filter(expires__lt=now).count(),
+                "grants": grant_model.objects.filter(expires__lt=now).count(),
+            }
+            for token_type, remaining in remaining_by_type.items():
+                metrics.clear_expired_remaining.labels(token_type=token_type).set(remaining)
+
+    return result
 
 
 def redirect_to_uri_allowed(uri, allowed_uris):

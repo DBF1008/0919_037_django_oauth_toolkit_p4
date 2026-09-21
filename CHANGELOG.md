@@ -15,6 +15,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [unreleased]
 
+### Added
+* `cleartokens` management command now supports `--batch-size`, `--batch-interval` and `--dry-run`
+  options, reports per-batch progress, and `clear_expired` returns a `ClearExpiredResult` summary.
+* Optional Prometheus metrics (`pip install django-oauth-toolkit[metrics]`) for token cleanup:
+  duration, deleted count per token type and remaining expired rows.
+
+### Changed
+* `clear_expired` deletes access tokens belonging to expired refresh tokens first, inside the same
+  batch transaction, avoiding foreign-key constraint failures during cleanup.
+
 ### Deprecated
 * Deprecate the `AUTHENTICATION_SERVER_EXP_TIME_ZONE` setting. Token introspection `exp` values are
   Unix timestamps and are always interpreted as UTC per RFC 7662/RFC 7519. The setting still works

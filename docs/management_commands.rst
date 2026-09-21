@@ -18,9 +18,31 @@ removed is ``REFRESH_TOKEN_EXPIRE_SECONDS`` + 1 day. This is normally not a
 problem since refresh tokens are long lived.
 
 To prevent the CPU and RAM high peaks during deletion process use ``CLEAR_EXPIRED_TOKENS_BATCH_SIZE`` and
-``CLEAR_EXPIRED_TOKENS_BATCH_INTERVAL`` settings to adjust the process speed.
+``CLEAR_EXPIRED_TOKENS_BATCH_INTERVAL`` settings to adjust the process speed. Both values can also be overridden
+per invocation with the ``--batch-size`` and ``--batch-interval`` command line options, and the command prints
+per-batch progress (deleted count and rows remaining) while it runs.
 
-The ``cleartokens`` management command will also delete expired access and ID tokens alongside expired refresh tokens.
+The ``cleartokens`` management command will also delete expired access and ID tokens alongside expired refresh
+tokens. Expired refresh tokens are removed together with their related access (and, by cascade, ID) tokens: the
+dependent tokens are deleted first, in the same batch transaction, so foreign-key constraints cannot block the
+cleanup.
+
+A preview mode is available to inspect the tokens that would be removed without changing any data::
+
+    python manage.py cleartokens --dry-run
+
+Prometheus metrics
+^^^^^^^^^^^^^^^^^^
+
+When the optional ``prometheus-client`` dependency is installed (``pip install django-oauth-toolkit[metrics]``),
+``clear_expired`` records the following metrics:
+
+* ``oauth2_provider_clear_expired_duration_seconds`` (histogram, labelled by ``status="success|failure"``):
+  wall-clock duration of a cleanup run.
+* ``oauth2_provider_clear_expired_deleted_total`` (counter, labelled by ``token_type``): number of rows deleted
+  per token category.
+* ``oauth2_provider_clear_expired_remaining`` (gauge, labelled by ``token_type``): number of expired rows still
+  present after the run.
 
 Note: Refresh tokens need to expire before AccessTokens can be removed from the
 database. Using ``cleartokens`` without ``REFRESH_TOKEN_EXPIRE_SECONDS`` has limited effect.
